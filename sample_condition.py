@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 from guided_diffusion.condition_methods import get_conditioning_method
 from guided_diffusion.measurements import get_noise, get_operator
-from guided_diffusion.unet import create_model
+from image_synthesis.modeling.build import create_model
 from guided_diffusion.gaussian_diffusion import create_sampler
 from data.dataloader import get_dataset, get_dataloader
 from util.img_utils import clear_color, mask_generator
@@ -24,7 +24,7 @@ def load_yaml(file_path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_config', type=str)
+    parser.add_argument('--model_config', type=str) # coco.yaml
     parser.add_argument('--diffusion_config', type=str)
     parser.add_argument('--task_config', type=str)
     parser.add_argument('--gpu', type=int, default=0)
@@ -43,12 +43,9 @@ def main():
     model_config = load_yaml(args.model_config)
     diffusion_config = load_yaml(args.diffusion_config)
     task_config = load_yaml(args.task_config)
-   
-    #assert model_config['learn_sigma'] == diffusion_config['learn_sigma'], \
-    #"learn_sigma must be the same for model and diffusion configuartion."
     
     # Load model
-    model = create_model(**model_config)
+    model = create_model(model_config)
     model = model.to(device)
     model.eval()
 
@@ -77,7 +74,7 @@ def main():
     # Prepare dataloader
     data_config = task_config['data']
     transform = transforms.Compose([transforms.ToTensor(),
-                                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+                                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]) # transform pic to tensor and normalize it. 'Compose' could be viewed as 
     dataset = get_dataset(**data_config, transforms=transform)
     loader = get_dataloader(dataset, batch_size=1, num_workers=0, train=False)
 
@@ -105,12 +102,12 @@ def main():
             y_n = noiser(y)
 
         else: 
-            # Forward measurement model (Ax + n)
+            # Forward measurement model (Ax + n) 此处给y添加噪声
             y = operator.forward(ref_img)
             y_n = noiser(y)
          
         # Sampling
-        x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
+        x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32).requires_grad_()
         sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
 
         plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))

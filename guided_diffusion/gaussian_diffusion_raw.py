@@ -4,14 +4,12 @@ from functools import partial
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tqdm.auto import tqdm
-import torch.optim as optim
 
 from util.img_utils import clear_color
 from .posterior_mean_variance import get_mean_processor, get_var_processor
 
-NUM_CLASSES = 1000 # from unet
+
 
 __SAMPLER__ = {}
 
@@ -54,38 +52,6 @@ def create_sampler(sampler,
                    clip_denoised=clip_denoised, 
                    rescale_timesteps=rescale_timesteps)
 
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-def log_add_exp(a, b):
-    maximum = torch.max(a, b)
-    return maximum + torch.log(torch.exp(a - maximum) + torch.exp(b - maximum))
-
-def index_to_log_onehot(x, num_classes=NUM_CLASSES):
-    assert x.max().item() < num_classes, \
-        f'Error: {x.max().item()} >= {num_classes}'
-    x_onehot = F.one_hot(x, num_classes)
-    permute_order = (0, -1) + tuple(range(1, len(x.size())))
-    x_onehot = x_onehot.permute(permute_order)
-    log_x = torch.log(x_onehot.float().clamp(min=1e-30))
-    return log_x
-
-def alpha_schedule(time_step, N=100, att_1 = 0.99999, att_T = 0.000009, ctt_1 = 0.000009, ctt_T = 0.99999):
-    att = np.arange(0, time_step)/(time_step-1)*(att_T - att_1) + att_1
-    att = np.concatenate(([1], att))
-    at = att[1:]/att[:-1]
-    ctt = np.arange(0, time_step)/(time_step-1)*(ctt_T - ctt_1) + ctt_1
-    ctt = np.concatenate(([0], ctt))
-    one_minus_ctt = 1 - ctt
-    one_minus_ct = one_minus_ctt[1:] / one_minus_ctt[:-1]
-    ct = 1-one_minus_ct
-    bt = (1-at-ct)/N
-    att = np.concatenate((att[1:], [1]))
-    ctt = np.concatenate((ctt[1:], [0]))
-    btt = (1-att-ctt)/N
-    return at, bt, ct, att, btt, ctt
 
 class GaussianDiffusion:
     def __init__(self,
@@ -94,8 +60,7 @@ class GaussianDiffusion:
                  model_var_type,
                  dynamic_threshold,
                  clip_denoised,
-                 rescale_timesteps,
-                 temperature=1.0
+                 rescale_timesteps
                  ):
 
         # use float64 for accuracy.
@@ -145,30 +110,62 @@ class GaussianDiffusion:
     
         self.var_processor = get_var_processor(model_var_type,
                                                betas=betas)
-        
-        #gumble_softmax temperature
-        self.temperature = temperature
-        self.num_classes = NUM_CLASSES # for example; is determined by the model
-        
-        at, bt, ct, att, btt, ctt = alpha_schedule(self.num_timesteps, N=self.num_classes-1)
 
-        at = torch.tensor(at.astype('float64')).to('cuda')
-        bt = torch.tensor(bt.astype('float64')).to('cuda')
-        ct = torch.tensor(ct.astype('float64')).to('cuda')
-        log_at = torch.log(at)
-        log_bt = torch.log(bt)
-        log_ct = torch.log(ct)
-        att = torch.tensor(att.astype('float64'))
-        btt = torch.tensor(btt.astype('float64'))
-        ctt = torch.tensor(ctt.astype('float64'))
-        log_cumprod_at = torch.log(att)
-        log_cumprod_bt = torch.log(btt)
-        log_cumprod_ct = torch.log(ctt)
-        self.log_cumprod_at= log_cumprod_at.float().to('cuda')
-        self.log_cumprod_bt= log_cumprod_bt.float().to('cuda')
-        self.log_cumprod_ct= log_cumprod_ct.float().to('cuda')
-        self.log_1_min_cumprod_ct = torch.log(1 - log_cumprod_ct.exp() + 1e-40).to('cuda')
+    def q_mean_variance(self, x_start, t):
+        """
+        Get the distribution q(x_t | x_0).
 
+        :param x_start: the [N x C x ...] tensor of noiseless inputs.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
+        """
+        
+        mean = extract_and_expand(self.sqrt_alphas_cumprod, t, x_start) * x_start
+        variance = extract_and_expand(1.0 - self.alphas_cumprod, t, x_start)
+        log_variance = extract_and_expand(self.log_one_minus_alphas_cumprod, t, x_start)
+
+        return mean, variance, log_variance
+
+    def q_sample(self, x_start, t):
+        """
+        Diffuse the data for a given number of diffusion steps.
+
+        In other words, sample from q(x_t | x_0).
+
+        :param x_start: the initial data batch.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :param noise: if specified, the split-out normal noise.
+        :return: A noisy version of x_start.
+        """
+        noise = torch.randn_like(x_start)
+        assert noise.shape == x_start.shape
+        
+        coef1 = extract_and_expand(self.sqrt_alphas_cumprod, t, x_start)
+        coef2 = extract_and_expand(self.sqrt_one_minus_alphas_cumprod, t, x_start)
+
+        return coef1 * x_start + coef2 * noise
+
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        """
+        Compute the mean and variance of the diffusion posterior:
+
+            q(x_{t-1} | x_t, x_0)
+
+        """
+        assert x_start.shape == x_t.shape
+        coef1 = extract_and_expand(self.posterior_mean_coef1, t, x_start)
+        coef2 = extract_and_expand(self.posterior_mean_coef2, t, x_t)
+        posterior_mean = coef1 * x_start + coef2 * x_t
+        posterior_variance = extract_and_expand(self.posterior_variance, t, x_t)
+        posterior_log_variance_clipped = extract_and_expand(self.posterior_log_variance_clipped, t, x_t)
+
+        assert (
+            posterior_mean.shape[0]
+            == posterior_variance.shape[0]
+            == posterior_log_variance_clipped.shape[0]
+            == x_start.shape[0]
+        )
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_sample_loop(self,
                       model,
@@ -207,9 +204,8 @@ class GaussianDiffusion:
                     file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
                     plt.imsave(file_path, clear_color(img))
 
-        return img  
-    
-
+        return img       
+        
     def p_sample(self, model, x, t):
         raise NotImplementedError
 
@@ -299,7 +295,7 @@ def space_timesteps(num_timesteps, section_counts):
 
 class SpacedDiffusion(GaussianDiffusion):
     """
-    A diffusion process which can skip steps in a base diffusion process. It can speed up the sampling speed
+    A diffusion process which can skip steps in a base diffusion process.
     :param use_timesteps: a collection (sequence or set) of timesteps from the
                           original diffusion process to retain.
     :param kwargs: the kwargs to create the base diffusion process.
@@ -375,123 +371,7 @@ class DDPM(SpacedDiffusion):
             sample += torch.exp(0.5 * out['log_variance']) * noise
 
         return {'sample': sample, 'pred_xstart': out['pred_xstart']}
-
-@register_sampler(name='g2d2')
-class G2D2(SpacedDiffusion):
-    def p_sample(self, model, x, t):
-        out = model.transformer.sample(condition_token=None,
-                                                    condition_mask=None,
-                                                    condition_embed=None,
-                                                    content_token=x)
     
-    def q_pred(self, log_x_start, t):           # q(xt|x0)
-        # log_x_start can be onehot or not
-        t = (t + (self.num_timesteps + 1))%(self.num_timesteps + 1)
-        log_cumprod_at = extract(self.log_cumprod_at, t, log_x_start.shape)         # at~
-        log_cumprod_bt = extract(self.log_cumprod_bt, t, log_x_start.shape)         # bt~
-        log_cumprod_ct = extract(self.log_cumprod_ct, t, log_x_start.shape)         # ct~
-        log_1_min_cumprod_ct = extract(self.log_1_min_cumprod_ct, t, log_x_start.shape)       # 1-ct~
-        
-
-        log_probs = torch.cat(
-            [
-                log_add_exp(log_x_start[:,:-1,:]+log_cumprod_at, log_cumprod_bt),
-                log_add_exp(log_x_start[:,-1:,:]+log_1_min_cumprod_ct, log_cumprod_ct)
-            ],
-            dim=1
-        )
-
-        return log_probs
-
-    def log_sample_categorical(self, logits):           # use gumbel to sample onehot vector from log probability also used in g2d2
-        uniform = torch.rand_like(logits)
-        gumbel_noise = -torch.log(-torch.log(uniform + 1e-30) + 1e-30)
-        sample = (gumbel_noise + logits).argmax(dim=1)
-        log_sample = index_to_log_onehot(sample, self.num_classes)
-        return log_sample
-    
-
-    def q_sample(self, log_x_start, t):                 # diffusion step, q(xt|x0) and sample xt
-        log_EV_qxt_x0 = self.q_pred(log_x_start, t)
-
-        log_sample = self.log_sample_categorical(log_EV_qxt_x0)
-
-        return log_sample
-
-    def p_sample_loop(self,
-                      model,
-                      x_start,
-                      measurement,
-                      measurement_cond_fn,
-                      record,
-                      save_root,
-                      gamma = 0.1,
-                      DL_balance= 0.5):
-        """
-        The function used for sampling from noise.
-        gamma: forget coefficient
-        DL_balance: the balance between KL divergence and likelihood.
-        """ 
-        
-        
-        zt = model.content_codec.get_tokens(x_start)['token'] # bs,embedding_dim
-        device = x_start.device
-
-        pbar = tqdm(list(range(self.num_timesteps))[::-1]) #1kstep for total
-        for idx in pbar:
-            time = torch.tensor([idx] * zt.shape[0], device=device)
-            
-            # zt = zt.requires_grad_()
-            out = self.p_sample(x=zt, t=time, model=model) # alpha
-            if idx == self.num_timesteps-1:
-                alpha = torch.log(out['sample'])
-            else:
-                alpha = torch.exp(gamma*torch.log(alpha)+(1-gamma)*out)
-            
-            max_iter = 1000
-
-            # calculate p_alpha,using gumbel-softmax
-            p_alpha = self.log_sample_categorical(alpha,tau=self.temperature)
-            
-            # calculate likelihood
-            sample = self.q_sample(measurement, t=time)
-            for i in range(self.num_timesteps):
-                if i == 0:
-                    likelihood = torch.dist(measurement,sample[:,i,:,:])
-                else:
-                    likelihood += torch.dist(measurement,sample[:,i,:,:])
-
-            # optimize alpha using adam(according to implementation)
-            optimizer = optim.Adam([p_alpha], lr=0.001)
-            for i in range(max_iter):
-                optimizer.zero_grad()
-                # calculate KL divergence
-                divergence = 0
-                for i in range(self.num_classes):
-                    divergence +=p_alpha[i]*torch.log(p_alpha[i]/(alpha[i]+1e-10))
-                
-                obj = DL_balance * divergence + (1-DL_balance) * likelihood
-                obj.backward()
-                optimizer.step()
-                # Give condition.
-            
-            for i in range(self.num_classes):
-                if i == 0:
-                    zt = self.q_sample(x_start,t=time)*p_alpha[i]
-                else:
-                    zt += self.q_sample(x_start,t=time)*p_alpha[i]
-            content = log_onehot_to_index(zt)
-            img = model.content_codec.encode(content)
-            img = img.detach_()
-           
-            pbar.set_postfix({'loss': obj}, refresh=False)
-            if record:
-                if idx % 10 == 0:
-                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
-                    plt.imsave(file_path, img)
-
-        return img 
-
 
 @register_sampler(name='ddim')
 class DDIM(SpacedDiffusion):
