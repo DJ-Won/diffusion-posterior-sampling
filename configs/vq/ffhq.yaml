@@ -28,7 +28,7 @@ model:
           params:
             attn_type: 'self'
             n_layer: 20
-            content_seq_len: 256  # 32 x 32
+            content_seq_len: 1024  # 32 x 32  256(1)
             content_spatial_size: [16, 16]
             n_embd: 512 # the dim of embedding dims   # both this and content_emb_config
             n_head: 16 

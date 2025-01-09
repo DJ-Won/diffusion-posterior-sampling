@@ -215,7 +215,7 @@ class DiffusionTransformer(nn.Module):
             with autocast():
                 out = self.transformer(x_t, cond_emb, t)
         else:
-            out = self.transformer(x_t, cond_emb, t)
+            out = self.transformer(x_t, cond_emb, t) #1,1024,1024
 
         assert out.size(0) == x_t.size(0)
         assert out.size(1) == self.num_classes-1
@@ -587,7 +587,7 @@ class DiffusionTransformer(nn.Module):
 
         content_token = log_onehot_to_index(log_z)
         
-        output = {'content_token': content_token}
+        output = {'content_token': content_token,"log_z": log_z}
         if return_logits:
             output['logits'] = torch.exp(log_z)
         return output
