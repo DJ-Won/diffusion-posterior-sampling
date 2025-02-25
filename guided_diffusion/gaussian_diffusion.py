@@ -8,9 +8,10 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 import torch.optim as optim
 from copy import deepcopy
-
+import sys
+sys.path.append("/home/ubuntu/dingjuwang/min/dps")
 from util.img_utils import clear_color
-from .posterior_mean_variance import get_mean_processor, get_var_processor
+from guided_diffusion.posterior_mean_variance import get_mean_processor, get_var_processor
 
 NUM_CLASSES = 1024 # from diffusion
 
@@ -438,7 +439,7 @@ class G2D2(SpacedDiffusion):
         
         zt = model.content_codec.get_tokens(x_start)['token'] # bs,embedding_dim
         device = x_start.device
-        measurement = torch.exp(index_to_log_onehot(model.content_codec.get_tokens(measurement)['token']))
+        measurement = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'])
 
         pbar = tqdm(list(range(self.num_timesteps))[::-1]) #1kstep for total
         for idx in pbar:
@@ -455,8 +456,9 @@ class G2D2(SpacedDiffusion):
 
             
             # calculate likelihood
-            sample = torch.exp(self.q_sample(torch.log(measurement), t=time))
-            likelihood = torch.sqrt((measurement**2 + sample**2 - 2*torch.matmul(measurement,sample.transpose(1,2))).sum()) # Euclidean distance
+            sample = self.q_sample(measurement, t=time)
+            likelihood_ = torch.sqrt((measurement**2 + sample**2 - 2*torch.matmul(measurement,sample.transpose(1,2))).sum()) # Euclidean distance
+            likelihood = torch.sqrt(((measurement-sample)**2).sum())
 
             # optimize alpha using adam(according to implementation)
             optimizer = optim.Adam([p_alpha], lr=0.00001)
@@ -467,7 +469,7 @@ class G2D2(SpacedDiffusion):
                 # for i in range(self.num_classes):
                 #     divergence +=p_alpha[:,i]*torch.log(p_alpha[i]/(vq_theta[i]+1e-10))
                 divergence = (p_alpha*torch.log(p_alpha/(vq_theta+1e-10))).sum()
-                obj = (DL_balance * divergence - (1-DL_balance) * likelihood)/(vq_theta.shape[1]*vq_theta.shape[2])
+                obj = (DL_balance * divergence - (1-DL_balance) * sample)
                 obj.backward()
                 optimizer.step()
                 # Give condition.
