@@ -26,9 +26,12 @@ class Encoder(nn.Module):
         x = 2*x - 1
         h = self.encoder(x)
         h = self.quant_conv(h)
-        output = self.quantize(h) # quant, _, [_, _, indices] = self.quantize(h)
-        quant = output['quantize']
-        indices = output['index']
+        output = self.quantize(h)
+        try:
+            quant = output['quantize']
+            indices = output['index']
+        except:
+            quant, _, [_, _, indices] = output
         return indices.view(x.shape[0], -1)
 
 class Decoder(nn.Module):

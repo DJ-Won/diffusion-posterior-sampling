@@ -3,3 +3,5 @@ help_folder
 *.pyc
 bkse
 models
+results
+pretrain

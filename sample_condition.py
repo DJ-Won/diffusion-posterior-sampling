@@ -9,24 +9,23 @@ import matplotlib.pyplot as plt
 
 from guided_diffusion.condition_methods import get_conditioning_method
 from guided_diffusion.measurements import get_noise, get_operator
-from image_synthesis.modeling.build import create_model
+from image_synthesis.modeling.build import load_yaml
+from image_synthesis.modeling.build import get_model as get_VQmodel
+from guided_diffusion.unet import create_model as create_model_dps
 from guided_diffusion.gaussian_diffusion import create_sampler
 from data.dataloader import get_dataset, get_dataloader
 from util.img_utils import clear_color, mask_generator
 from util.logger import get_logger
 
 
-def load_yaml(file_path: str) -> dict:
-    with open(file_path) as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-    return config
+
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_config', type=str) # coco.yaml
-    parser.add_argument('--diffusion_config', type=str)
-    parser.add_argument('--task_config', type=str)
+    parser.add_argument('--model_config', type=str) # configs/vq/ffhq.yaml
+    parser.add_argument('--diffusion_config', type=str) # configs/diffusion_g2d2.yaml
+    parser.add_argument('--task_config', type=str) # configs/nonlinear_deblur_config.yaml
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./results')
     args = parser.parse_args()
@@ -40,12 +39,21 @@ def main():
     device = torch.device(device_str)  
     
     # Load configurations
-    model_config = load_yaml(args.model_config)
     diffusion_config = load_yaml(args.diffusion_config)
     task_config = load_yaml(args.task_config)
     
     # Load model
-    model = create_model(model_config)
+    
+    if "/vq/" in args.model_config:
+        info = get_VQmodel(ema=True, model_path='/home/wdj/projects/dps/OUTPUT/pretrained_model/coco_learnable.pth', config_path=args.model_config, imagenet_cf=False)
+        model = info['model']
+        epoch = info['epoch']
+        model_name = info['model_name']
+        for param in model.parameters(): 
+            param.requires_grad=False
+    else:
+        model_config = load_yaml(args.model_config)
+        model = create_model_dps(**model_config)
     model = model.to(device)
     model.eval()
 

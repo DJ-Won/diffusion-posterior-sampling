@@ -17,6 +17,18 @@ NUM_CLASSES = 1024 # from diffusion
 
 __SAMPLER__ = {}
 
+def index_to_log_onehot(x, num_classes):
+    assert x.max().item() < num_classes, \
+        f'Error: {x.max().item()} >= {num_classes}'
+    x_onehot = F.one_hot(x, num_classes)
+    permute_order = (0, -1) + tuple(range(1, len(x.size())))
+    x_onehot = x_onehot.permute(permute_order)
+    log_x = torch.log(x_onehot.float().clamp(min=1e-30))
+    return log_x
+
+def log_onehot_to_index(log_x):
+    return log_x.argmax(1)
+
 def register_sampler(name: str):
     def wrapper(cls):
         if __SAMPLER__.get(name, None):
@@ -65,14 +77,6 @@ def log_add_exp(a, b):
     maximum = torch.max(a, b)
     return maximum + torch.log(torch.exp(a - maximum) + torch.exp(b - maximum))
 
-def index_to_log_onehot(x, num_classes=NUM_CLASSES):
-    assert x.max().item() < num_classes, \
-        f'Error: {x.max().item()} >= {num_classes}'
-    x_onehot = F.one_hot(x, num_classes)
-    permute_order = (0, -1) + tuple(range(1, len(x.size())))
-    x_onehot = x_onehot.permute(permute_order)
-    log_x = torch.log(x_onehot.float().clamp(min=1e-30))
-    return log_x
 
 def alpha_schedule(time_step, N=100, att_1 = 0.99999, att_T = 0.000009, ctt_1 = 0.000009, ctt_T = 0.99999):
     att = np.arange(0, time_step)/(time_step-1)*(att_T - att_1) + att_1
@@ -171,7 +175,24 @@ class GaussianDiffusion:
         self.log_cumprod_ct= log_cumprod_ct.float().to('cuda')
         self.log_1_min_cumprod_ct = torch.log(1 - log_cumprod_ct.exp() + 1e-40).to('cuda')
 
+    def q_sample(self, x_start, t):
+        """
+        Diffuse the data for a given number of diffusion steps.
 
+        In other words, sample from q(x_t | x_0).
+
+        :param x_start: the initial data batch.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :param noise: if specified, the split-out normal noise.
+        :return: A noisy version of x_start.
+        """
+        noise = torch.randn_like(x_start)
+        assert noise.shape == x_start.shape
+        
+        coef1 = extract_and_expand(self.sqrt_alphas_cumprod, t, x_start)
+        coef2 = extract_and_expand(self.sqrt_one_minus_alphas_cumprod, t, x_start)
+
+        return coef1 * x_start + coef2 * noise
     def p_sample_loop(self,
                       model,
                       x_start,
@@ -520,6 +541,91 @@ class DDIM(SpacedDiffusion):
         coef2 = extract_and_expand(self.sqrt_recipm1_alphas_cumprod, t, x_t)
         return (coef1 * x_t - pred_xstart) / coef2
 
+@register_sampler(name='ss')
+class SS(SpacedDiffusion):
+    def p_sample_loop(self,
+                      model,
+                      x_start,
+                      measurement,
+                      measurement_cond_fn,
+                      record,
+                      save_root,
+                      text = 'a high-quality headshot of a person',
+                      num_class=2887):
+        """
+        The function used for sampling from noise.
+        """ 
+        img = x_start
+        device = x_start.device 
+        measurement = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
+
+        pbar = tqdm(list(range(1))[::-1]) ## self.num_timesteps
+        for idx in pbar:
+            batch = {}
+            batch['image'] = img
+            batch['text'] = text
+            condition = model.prepare_condition(batch)
+            content = model.prepare_content(batch)
+            content_samples = {'input_image': img}
+            content_samples['reconstruction_image'] = model.content_codec.decode(content['content_token']) 
+            num_content_tokens = int((content['content_token'].shape[1]))
+            content_token = content['content_token'][:, :num_content_tokens]
+            time = torch.tensor([idx] * img.shape[0], device=device)
+            
+            img = img.requires_grad_()
+            out = self.p_sample(content_token=content_token,content=content,condition=condition, t=time, model=model)
+            img = model.content_codec.decode(out['content_token'])
+            # Give condition.
+            noisy_measurement = model.transformer.q_sample(measurement, t=time)
+
+            # TODO: how can we handle argument for different condition method?
+            # img, distance = measurement_cond_fn(x_t=out['sample'],
+            #                           measurement=measurement,
+            #                           noisy_measurement=noisy_measurement,
+            #                           x_prev=img,
+            #                           x_0_hat=out['pred_xstart'])
+            # img = img.detach_()
+           
+            # pbar.set_postfix({'distance': distance.item()}, refresh=False)
+            
+            if record:
+                if idx % 10 == 0:
+                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
+                    plt.imsave(file_path, clear_color(img))
+
+        return img
+    
+    def p_sample(self, 
+                model, 
+                content_token, 
+                condition,
+                content,
+                t,
+                temperature = 1.,
+                return_rec = True,
+                return_logits = False,
+                return_att_weight = False):
+        filter_ratio = [0, 0.5, 1.0]
+        batch = {}
+        
+        trans_out = model.transformer.sample(condition_token=condition['condition_token'],
+                                                        condition_mask=condition.get('condition_mask', None),
+                                                        condition_embed=condition.get('condition_embed_token', None),
+                                                        content_token=content_token,
+                                                        filter_ratio=filter_ratio[0],
+                                                        temperature=temperature,
+                                                        return_att_weight=return_att_weight,
+                                                        return_logits=return_logits,
+                                                        content_logits=content.get('content_logits', None),
+                                                        sample_type='normal',)
+        log_z0 = trans_out['log_z']
+        log_zt_1 = model.transformer.q_pred(log_x_start=log_z0, t=t)
+        trans_out['sample'] = model.transformer.log_sample_categorical(log_zt_1)
+        trans_out['logzt'] = log_zt_1
+        trans_out['pred_xstart'] = log_z0
+        
+        return trans_out
+    
 
 # =================
 # Helper functions
@@ -608,3 +714,24 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
+
+    # def p_sample(self, x, t, cond, noise):
+
+    #     predicted_x0_logits = self.model_predict(x, t, cond) # bs maxlength cat
+    #     pred_q_posterior_logits = self.q_posterior_logits(predicted_x0_logits, x, t)
+
+    #     noise = torch.clip(noise, self.eps, 1.0)
+
+    #     not_first_step = (t != 1).float().reshape((x.shape[0], *[1] * (x.dim())))
+
+    #     gumbel_noise = -torch.log(-torch.log(noise))
+    #     sample = torch.argmax(
+    #         pred_q_posterior_logits + gumbel_noise * not_first_step, dim=-1
+    #     )
+    #     return sample
+    
+    # def p_sample_starshape(self, x, t, cond, noise):
+    #     pbar = tqdm(list(range(self.num_timesteps))[::-1]) #1kstep for total
+    #     z_t = x
+    #     for idx in pbar:
+    #         z_t_1 = self.p_sample()
