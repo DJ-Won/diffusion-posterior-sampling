@@ -50,7 +50,7 @@ def main():
         epoch = info['epoch']
         model_name = info['model_name']
         for param in model.parameters(): 
-            param.requires_grad=True
+            param.requires_grad=False
     else:
         model_config = load_yaml(args.model_config)
         model = create_model_dps(**model_config)
@@ -111,13 +111,12 @@ def main():
 
         else: 
             # Forward measurement model (Ax + n) 此处给y添加噪声
-
             y = operator.forward(ref_img)
             y_n = noiser(y)
          
         # Sampling
         if "/vq/" in args.model_config:
-            x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32).requires_grad_()
+            x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32)
         else:
             x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
         sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
@@ -128,3 +127,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
+    #tmux 21

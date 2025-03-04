@@ -188,7 +188,6 @@ class GaussianDiffusion:
         for idx in pbar:
             time = torch.tensor([idx] * img.shape[0], device=device)
             
-            img = img.requires_grad_()
             out = self.p_sample(x=img, t=time, model=model)
             
             # Give condition.
@@ -540,7 +539,6 @@ class SS(SpacedDiffusion):
 
         pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## 
         for idx in pbar:
-            img = img.requires_grad_()
             batch = {}
             batch['image'] = img
             batch['text'] = text
@@ -588,14 +586,14 @@ class SS(SpacedDiffusion):
             noisy_measurement = model.content_codec.decode(noisy_measurement.argmax(1))
 
             # TODO: how can we handle argument for different condition method?
-            img, distance = measurement_cond_fn(x_t=content.requires_grad_(),
-                                      measurement=measurement,
-                                      noisy_measurement=noisy_measurement,
-                                      x_prev=img.requires_grad_(),
-                                      x_0_hat=x_start)
-            # img = img.detach_()
+            # img, distance = measurement_cond_fn(x_t=content.requires_grad_(),
+            #                           measurement=measurement,
+            #                           noisy_measurement=noisy_measurement,
+            #                           x_prev=img.requires_grad_(),
+            #                           x_0_hat=x_start)
+            img = img.detach_()
            
-            # pbar.set_postfix({'distance': distance.item()}, refresh=False)
+            pbar.set_postfix({'distance': 0}, refresh=False) # distance.item()
             
             if record:
                 if idx % 10 == 0:

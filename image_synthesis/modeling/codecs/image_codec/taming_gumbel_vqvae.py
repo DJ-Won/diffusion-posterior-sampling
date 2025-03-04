@@ -21,7 +21,7 @@ class Encoder(nn.Module):
         self.quant_conv = quant_conv
         self.quantize = quantize
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def forward(self, x):
         x = 2*x - 1
         h = self.encoder(x)
@@ -43,7 +43,7 @@ class Decoder(nn.Module):
         self.w = w
         self.h = h
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def forward(self, indices):
         z = self.quantize.get_codebook_entry(indices.view(-1), shape=(indices.shape[0], self.h, self.w, -1))
         quant = self.post_quant_conv(z)
