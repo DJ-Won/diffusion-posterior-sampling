@@ -561,8 +561,8 @@ class DiffusionTransformer(nn.Module):
                 'content_logits': content_logits,
                 }
 
-        if input['content_token'] != None:
-            batch_size = input['content_token'].shape[0]
+        if input['condition_token'] != None:
+            batch_size = input['condition_token'].shape[0]
         else:
             batch_size = kwargs['batch_size']
     
@@ -573,8 +573,31 @@ class DiffusionTransformer(nn.Module):
         if content_token != None:
             sample_image = input['content_token'].type_as(input['content_token'])
 
-            cond_emb = None
+        if self.condition_emb is not None:  # do this
+            with torch.no_grad():
+                cond_emb = self.condition_emb(input['condition_token']) # B x Ld x D   #256*1024
+            cond_emb = cond_emb.float() #bs,77,512
+        else: # share condition embeding with content
+            if input.get('condition_embed_token', None) != None:
+                cond_emb = input['condition_embed_token'].float()
+            else:
+                cond_emb = None
 
+        if start_step == 0:
+            # use full mask sample
+            zero_logits = torch.zeros((batch_size, self.num_classes-1, self.shape),device=device) # num classes is from transformer, numclasses include
+            one_logits = torch.ones((batch_size, 1, self.shape),device=device)
+            mask_logits = torch.cat((zero_logits, one_logits), dim=1)
+            log_z = torch.log(mask_logits) # -inf occurs,
+            start_step = self.num_timesteps
+            with torch.no_grad():
+                for diffusion_index in range(start_step-1, -1, -1):
+                    t = torch.full((batch_size,), diffusion_index, device=device, dtype=torch.long)
+                    sampled = [0] * log_z.shape[0] # initalizing sampled
+                    while min(sampled) < self.n_sample[diffusion_index]:
+                        log_z, sampled = self.p_sample(log_z, cond_emb, t, sampled, self.n_sample[diffusion_index])     # log_z is log_onehot
+
+        else:
             t = torch.full((batch_size,), start_step-1, device=device, dtype=torch.long)
             log_x_start = index_to_log_onehot(sample_image, self.num_classes)
             log_xt = self.q_sample(log_x_start=log_x_start, t=t)
@@ -586,8 +609,9 @@ class DiffusionTransformer(nn.Module):
         
 
         content_token = log_onehot_to_index(log_z)
-        
-        output = {'content_token': content_token,"log_z": log_z}
+        log_xt = self.q_sample(log_x_start=log_z, t=t)
+        output = {'content_token': log_onehot_to_index(log_xt),
+                  'x_start': content_token}
         if return_logits:
             output['logits'] = torch.exp(log_z)
         return output

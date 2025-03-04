@@ -63,7 +63,7 @@ class DALLE(nn.Module):
         cond = batch[cond_key] if condition is None else condition
         if torch.is_tensor(cond):
             cond = cond.to(self.device)
-        cond = self.condition_codec.get_tokens(cond)
+        cond = self.condition_codec.get_tokens(cond) # grad unrequired
         cond_ = {}
         for k, v in cond.items():
             v = v.to(self.device) if torch.is_tensor(v) else v
@@ -183,7 +183,7 @@ class DALLE(nn.Module):
                 if condition[k] is not None:
                     condition[k] = torch.cat([condition[k] for _ in range(replicate)], dim=0)
             
-        content_token = None
+        content_token = self.prepare_content(batch=batch)
 
         if len(sample_type.split(',')) > 1:
             if sample_type.split(',')[1][:1]=='q':
@@ -214,7 +214,7 @@ class DALLE(nn.Module):
             trans_out = self.transformer.sample(condition_token=condition['condition_token'],
                                             condition_mask=condition.get('condition_mask', None),
                                             condition_embed=condition.get('condition_embed_token', None),
-                                            content_token=content_token,
+                                            content_token=content_token.get('content_token', None),
                                             filter_ratio=filter_ratio,
                                             temperature=temperature,
                                             return_att_weight=return_att_weight,
@@ -224,9 +224,11 @@ class DALLE(nn.Module):
 
 
         content = self.content_codec.decode(trans_out['content_token'])  #(8,1024)->(8,3,256,256)
+        x_start = self.content_codec.decode(trans_out['x_start'])
         self.train()
         out = {
-            'content': content
+            'content': content,
+            'x_start': x_start,
         }
         
 

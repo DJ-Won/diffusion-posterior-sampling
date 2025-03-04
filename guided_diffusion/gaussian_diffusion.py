@@ -12,6 +12,7 @@ import sys
 sys.path.append("/home/ubuntu/dingjuwang/min/dps")
 from util.img_utils import clear_color
 from guided_diffusion.posterior_mean_variance import get_mean_processor, get_var_processor
+from PIL import Image
 
 NUM_CLASSES = 1024 # from diffusion
 
@@ -151,29 +152,6 @@ class GaussianDiffusion:
     
         self.var_processor = get_var_processor(model_var_type,
                                                betas=betas)
-        
-        #gumble_softmax temperature
-        self.temperature = temperature
-        self.num_classes = NUM_CLASSES # for example; is determined by the model
-        
-        at, bt, ct, att, btt, ctt = alpha_schedule(self.num_timesteps, N=self.num_classes-1)
-
-        at = torch.tensor(at.astype('float64')).to('cuda')
-        bt = torch.tensor(bt.astype('float64')).to('cuda')
-        ct = torch.tensor(ct.astype('float64')).to('cuda')
-        log_at = torch.log(at)
-        log_bt = torch.log(bt)
-        log_ct = torch.log(ct)
-        att = torch.tensor(att.astype('float64'))
-        btt = torch.tensor(btt.astype('float64'))
-        ctt = torch.tensor(ctt.astype('float64'))
-        log_cumprod_at = torch.log(att)
-        log_cumprod_bt = torch.log(btt)
-        log_cumprod_ct = torch.log(ctt)
-        self.log_cumprod_at= log_cumprod_at.float().to('cuda')
-        self.log_cumprod_bt= log_cumprod_bt.float().to('cuda')
-        self.log_cumprod_ct= log_cumprod_ct.float().to('cuda')
-        self.log_1_min_cumprod_ct = torch.log(1 - log_cumprod_ct.exp() + 1e-40).to('cuda')
 
     def q_sample(self, x_start, t):
         """
@@ -557,41 +535,80 @@ class SS(SpacedDiffusion):
         """ 
         img = x_start
         device = x_start.device 
-        measurement = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
+        measurement = measurement * 255
+        measurement_ = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
 
-        pbar = tqdm(list(range(1))[::-1]) ## self.num_timesteps
+        pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## 
         for idx in pbar:
+            img = img.requires_grad_()
             batch = {}
             batch['image'] = img
             batch['text'] = text
-            condition = model.prepare_condition(batch)
-            content = model.prepare_content(batch)
-            content_samples = {'input_image': img}
-            content_samples['reconstruction_image'] = model.content_codec.decode(content['content_token']) 
-            num_content_tokens = int((content['content_token'].shape[1]))
-            content_token = content['content_token'][:, :num_content_tokens]
+            ###
+            
+            vq_content = model.generate_content(
+                batch=batch,
+                filter_ratio=0,
+                replicate=1,
+                content_ratio=1,
+                return_att_weight=False,
+                sample_type="top0.86r",
+            )
+            x_start = vq_content['content']
+            content = vq_content['x_start'] # discrete, thus no gradient included
+            # condition = model.prepare_condition(batch)
+            # cf_condition = model.prepare_condition(batch=batch)
+            # cf_cond_emb = model.transformer.condition_emb(cf_condition['condition_token']).float()
+            # def cf_predict_start(log_x_t, cond_emb, t):
+            #     log_x_recon = model.transformer.predict_start(log_x_t, cond_emb, t)[:, :-1]
+            #     if abs(model.guidance_scale - 1) < 1e-3:
+            #         return torch.cat((log_x_recon, model.transformer.zero_vector), dim=1)
+            #     cf_log_x_recon = model.transformer.predict_start(log_x_t, cf_cond_emb.type_as(cond_emb), t)[:, :-1]
+            #     log_new_x_recon = cf_log_x_recon + model.guidance_scale * (log_x_recon - cf_log_x_recon)
+            #     log_new_x_recon -= torch.logsumexp(log_new_x_recon, dim=1, keepdim=True)
+            #     log_new_x_recon = log_new_x_recon.clamp(-70, 0)
+            #     log_pred = torch.cat((log_new_x_recon, model.transformer.zero_vector), dim=1)
+            #     return log_pred
+            
+            # model.transformer.cf_predict_start = model.predict_start_with_truncation(cf_predict_start, 'top0.86r') # truncation, 截断
+            # model.truncation_forward = True
+            # ###
+            # content = model.prepare_content(batch)
+            # content_samples = {'input_image': img}
+            # content_samples['reconstruction_image'] = model.content_codec.decode(content['content_token']) 
+            # num_content_tokens = int((content['content_token'].shape[1]))
+            # content_token = content['content_token'][:, :num_content_tokens]
             time = torch.tensor([idx] * img.shape[0], device=device)
             
-            img = img.requires_grad_()
-            out = self.p_sample(content_token=content_token,content=content,condition=condition, t=time, model=model)
-            img = model.content_codec.decode(out['content_token'])
+            # img = img.requires_grad_()
+            # out = self.p_sample(content_token=content_token,content=content,condition=condition, t=time, model=model)
+            # img = model.content_codec.decode(out['content_token'])
             # Give condition.
-            noisy_measurement = model.transformer.q_sample(measurement, t=time)
+            noisy_measurement = model.transformer.q_sample(measurement_, t=time)
+            noisy_measurement = model.content_codec.decode(noisy_measurement.argmax(1))
 
             # TODO: how can we handle argument for different condition method?
-            # img, distance = measurement_cond_fn(x_t=out['sample'],
-            #                           measurement=measurement,
-            #                           noisy_measurement=noisy_measurement,
-            #                           x_prev=img,
-            #                           x_0_hat=out['pred_xstart'])
+            img, distance = measurement_cond_fn(x_t=content.requires_grad_(),
+                                      measurement=measurement,
+                                      noisy_measurement=noisy_measurement,
+                                      x_prev=img.requires_grad_(),
+                                      x_0_hat=x_start)
             # img = img.detach_()
            
             # pbar.set_postfix({'distance': distance.item()}, refresh=False)
             
             if record:
                 if idx % 10 == 0:
-                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
-                    plt.imsave(file_path, clear_color(img))
+                    content = img.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
+                    for b in range(content.shape[0]):
+                        cnt = b
+                        save_base_name = '{}'.format(str(cnt).zfill(6))
+                        save_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
+                        im = Image.fromarray(content[b])
+                        im.save(save_path)
+                    
+                    # file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
+                    # plt.imsave(file_path, img)
 
         return img
     

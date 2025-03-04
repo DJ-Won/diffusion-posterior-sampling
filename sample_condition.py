@@ -45,12 +45,12 @@ def main():
     # Load model
     
     if "/vq/" in args.model_config:
-        info = get_VQmodel(ema=True, model_path='/home/wdj/projects/dps/OUTPUT/pretrained_model/coco_learnable.pth', config_path=args.model_config, imagenet_cf=False)
+        info = get_VQmodel(ema=True, model_path='./OUTPUT/pretrained_model/coco_learnable.pth', config_path=args.model_config, imagenet_cf=False)
         model = info['model']
         epoch = info['epoch']
         model_name = info['model_name']
         for param in model.parameters(): 
-            param.requires_grad=False
+            param.requires_grad=True
     else:
         model_config = load_yaml(args.model_config)
         model = create_model_dps(**model_config)
@@ -111,11 +111,15 @@ def main():
 
         else: 
             # Forward measurement model (Ax + n) 此处给y添加噪声
+
             y = operator.forward(ref_img)
             y_n = noiser(y)
          
         # Sampling
-        x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32).requires_grad_()
+        if "/vq/" in args.model_config:
+            x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32).requires_grad_()
+        else:
+            x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
         sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
 
         plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))
