@@ -228,12 +228,12 @@ class DALLE(nn.Module):
                                             start_step=start_step)
 
 
-        content = trans_out['content_token']  #(8,1024)->(8,3,256,256)
-        x_start = trans_out['x_start']
+
         self.train()
         out = {
-            'content': content,
-            'x_start': x_start,
+            'content': trans_out['content_token'],
+            'x_start': trans_out['x_start'],
+            'x_start_log':  trans_out['log_z']
         }
         
 

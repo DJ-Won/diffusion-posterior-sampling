@@ -119,7 +119,7 @@ def main():
             x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32)
         else:
             x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
-        sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
+        sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path,operator = operator)
 
         plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))
         plt.imsave(os.path.join(out_path, 'label', fname), clear_color(ref_img))

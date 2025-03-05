@@ -616,7 +616,8 @@ class DiffusionTransformer(nn.Module):
         
             content_token = log_onehot_to_index(log_z)
             output = {'content_token': None,
-                    'x_start': content_token}
+                    'x_start': content_token,
+                    'log_z': log_z}
             if return_logits:
                 output['logits'] = torch.exp(log_z)
 

@@ -156,7 +156,8 @@ class GaussianDiffusion:
                       measurement,
                       measurement_cond_fn,
                       record,
-                      save_root):
+                      save_root,
+                      operator):
         """
         The function used for sampling from noise.
         """ 
@@ -369,7 +370,8 @@ class G2D2(SpacedDiffusion):
                       text = 'a high-quality headshot of a boy',
                       num_class=2887,
                       gamma = 0.1,
-                      DL_balance= 0.5):
+                      DL_balance= 0.5,
+                      operator=None):
 
         """
         The function used for sampling from noise.
@@ -380,13 +382,15 @@ class G2D2(SpacedDiffusion):
         device = x_start.device 
         measurement = torch.clamp(measurement * 255, max=255)
         measurement_ = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
-        content = None
         pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## self.num_timesteps
 
         time_now = datetime.datetime.now()
         time_now = str(time_now).replace(' ','_')
         os.makedirs(os.path.join(save_root,time_now,'progress'))
-        alpha = None
+        
+        p_alpha = None
+        x0_pred_logit = None
+        
         for idx in pbar:
             batch = {}
             batch['image'] = img
@@ -401,15 +405,15 @@ class G2D2(SpacedDiffusion):
                 return_att_weight=False,
                 sample_type="top0.86r",
                 start_step = idx+1,
-                predx0=content,
+                predx0=x0_pred_logit, #logits
             )
-            vq_theta = vq_content['x_start'] # discrete, thus no gradient included, predicted x0
-            log_x0_pred = index_to_log_onehot(x0_pred)
-            time = torch.tensor([idx] * img.shape[0], device=device)
-            if alpha == None:
-                alpha = x0_pred
+
+            vq_theta = torch.exp(vq_content['x_start_log'])
+
+            if p_alpha == None:
+                p_alpha = vq_theta
             else:
-                alpha = gamma*alpha + (1-gamma)*log_x0_pred     
+                p_alpha = gamma*p_alpha + (1-gamma)*vq_theta  
 
             max_iter = 1000
             
@@ -419,22 +423,23 @@ class G2D2(SpacedDiffusion):
             for i in range(max_iter):
                 optimizer.zero_grad()
                 # calculate KL divergence
-                p_alpha = torch.softmax(p_alpha)
+                p_alpha = torch.softmax(p_alpha,dim=1)
                 divergence = (p_alpha*torch.log(p_alpha/(vq_theta+1e-10))).sum()
                 # calculate distance
                 sample = F.gumbel_softmax(p_alpha)
+                Zgum = torch.zeros_like(sample)
+                for i in range(sample.shape[0]):
+                    for j in range(sample.shape[1]):
+                        Zgum[0,i,:] = i * sample[i,j,:]
+                Zgum = Zgum.sum(dim=1)
                 sample_img = model.content_codec.decode(sample)
-                likelihood = torch.sqrt(((measurement-sample_img)**2).sum())
+                noised_img = operator.forward(sample_img)
+                likelihood = torch.sqrt(((measurement-noised_img)**2).sum())
                 obj = (DL_balance * divergence - (1-DL_balance) * likelihood)
                 obj.backward()
                 optimizer.step()
                 # Give condition.
-            
-            zt = self.q_sample(index_to_log_onehot(zt),t=time)*p_alpha
-            zt = log_onehot_to_index(zt)
-            img = model.content_codec.encode(zt)
-            img = img.detach_()
-            content_ = model.content_codec.decode(content)
+            x0_pred_logit = log_onehot_to_index(p_alpha)
             pbar.set_postfix({'loss': obj}, refresh=False)
             if record:
                 if idx % 1 == 0:
@@ -490,7 +495,8 @@ class SS(SpacedDiffusion):
                       record,
                       save_root,
                       text = 'a high-quality headshot of a boy',
-                      num_class=2887,):
+                      num_class=2887,
+                      operator=None):
         """
         The function used for sampling from noise.
         """ 
