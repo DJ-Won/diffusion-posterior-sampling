@@ -123,7 +123,12 @@ def main():
 
         plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))
         plt.imsave(os.path.join(out_path, 'label', fname), clear_color(ref_img))
-        plt.imsave(os.path.join(out_path, 'recon', fname), clear_color(sample))
+        if "/vq/" in args.model_config:
+            pass
+            # plt.imsave(os.path.join(out_path, 'recon', fname), sample)
+        else:
+            plt.imsave(os.path.join(out_path, 'recon', fname), clear_color(sample))
+        break
 
 if __name__ == '__main__':
     main()

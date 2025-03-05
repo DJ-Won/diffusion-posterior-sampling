@@ -13,6 +13,9 @@ sys.path.append("/home/ubuntu/dingjuwang/min/dps")
 from util.img_utils import clear_color
 from guided_diffusion.posterior_mean_variance import get_mean_processor, get_var_processor
 from PIL import Image
+import datetime
+
+
 
 NUM_CLASSES = 1024 # from diffusion
 
@@ -69,30 +72,6 @@ def create_sampler(sampler,
                    clip_denoised=clip_denoised, 
                    rescale_timesteps=rescale_timesteps)
 
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-def log_add_exp(a, b):
-    maximum = torch.max(a, b)
-    return maximum + torch.log(torch.exp(a - maximum) + torch.exp(b - maximum))
-
-
-def alpha_schedule(time_step, N=100, att_1 = 0.99999, att_T = 0.000009, ctt_1 = 0.000009, ctt_T = 0.99999):
-    att = np.arange(0, time_step)/(time_step-1)*(att_T - att_1) + att_1
-    att = np.concatenate(([1], att))
-    at = att[1:]/att[:-1]
-    ctt = np.arange(0, time_step)/(time_step-1)*(ctt_T - ctt_1) + ctt_1
-    ctt = np.concatenate(([0], ctt))
-    one_minus_ctt = 1 - ctt
-    one_minus_ct = one_minus_ctt[1:] / one_minus_ctt[:-1]
-    ct = 1-one_minus_ct
-    bt = (1-at-ct)/N
-    att = np.concatenate((att[1:], [1]))
-    ctt = np.concatenate((ctt[1:], [0]))
-    btt = (1-att-ctt)/N
-    return at, bt, ct, att, btt, ctt
 
 class GaussianDiffusion:
     def __init__(self,
@@ -187,7 +166,7 @@ class GaussianDiffusion:
         pbar = tqdm(list(range(self.num_timesteps))[::-1])
         for idx in pbar:
             time = torch.tensor([idx] * img.shape[0], device=device)
-            
+            img = img.requires_grad_()
             out = self.p_sample(x=img, t=time, model=model)
             
             # Give condition.
@@ -203,13 +182,12 @@ class GaussianDiffusion:
            
             pbar.set_postfix({'distance': distance.item()}, refresh=False)
             if record:
-                if idx % 10 == 0:
+                if idx % 100 == 0:
                     file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
                     plt.imsave(file_path, clear_color(img))
 
         return img  
     
-
     def p_sample(self, model, x, t):
         raise NotImplementedError
 
@@ -378,47 +356,9 @@ class DDPM(SpacedDiffusion):
 
 @register_sampler(name='g2d2')
 class G2D2(SpacedDiffusion):
-    def p_sample(self, model, x, t):
-        out = model.transformer.sample(condition_token=None,
-                                                    condition_mask=None,
-                                                    condition_embed=None,
-                                                    content_token=x)
-        return out
-    
-    def q_pred(self, log_x_start, t):           # q(xt|x0)
-        # log_x_start can be onehot or not
-        t = (t + (self.num_timesteps + 1))%(self.num_timesteps + 1)
-        log_cumprod_at = extract(self.log_cumprod_at, t, log_x_start.shape)         # at~
-        log_cumprod_bt = extract(self.log_cumprod_bt, t, log_x_start.shape)         # bt~
-        log_cumprod_ct = extract(self.log_cumprod_ct, t, log_x_start.shape)         # ct~
-        log_1_min_cumprod_ct = extract(self.log_1_min_cumprod_ct, t, log_x_start.shape)       # 1-ct~
-        
-
-        log_probs = torch.cat(
-            [
-                log_add_exp(log_x_start[:,:-1,:]+log_cumprod_at, log_cumprod_bt),
-                log_add_exp(log_x_start[:,-1:,:]+log_1_min_cumprod_ct, log_cumprod_ct)
-            ],
-            dim=1
-        )
-
-        return log_probs
-
-    def log_sample_categorical(self, logits):           # use gumbel to sample onehot vector from log probability .also used in g2d2
-        uniform = torch.rand_like(logits)
-        gumbel_noise = -torch.log(-torch.log(uniform + 1e-30) + 1e-30)
-        sample = (gumbel_noise + logits).argmax(dim=1)
-        log_sample = index_to_log_onehot(sample, self.num_classes)
-        return log_sample
-    
-
-    def q_sample(self, log_x_start, t):                 # diffusion step, q(xt|x0) and sample xt
-        log_EV_qxt_x0 = self.q_pred(log_x_start, t)
-
-        log_sample = self.log_sample_categorical(log_EV_qxt_x0)
-
-        return log_sample
-
+    def multinomial_kl(self, log_prob1, log_prob2):   # compute KL loss on log_prob
+        kl = (log_prob1.exp() * (log_prob1 - log_prob2)).sum(dim=1)
+        return kl
     def p_sample_loop(self,
                       model,
                       x_start,
@@ -426,48 +366,66 @@ class G2D2(SpacedDiffusion):
                       measurement_cond_fn,
                       record,
                       save_root,
+                      text = 'a high-quality headshot of a boy',
+                      num_class=2887,
                       gamma = 0.1,
                       DL_balance= 0.5):
+
         """
         The function used for sampling from noise.
         gamma: forget coefficient
         DL_balance: the balance between KL divergence and likelihood.
         """ 
-        
-        
-        zt = model.content_codec.get_tokens(x_start)['token'] # bs,embedding_dim
-        device = x_start.device
-        measurement = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'])
+        img = x_start
+        device = x_start.device 
+        measurement = torch.clamp(measurement * 255, max=255)
+        measurement_ = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
+        content = None
+        pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## self.num_timesteps
 
-        pbar = tqdm(list(range(self.num_timesteps))[::-1]) #1kstep for total
+        time_now = datetime.datetime.now()
+        time_now = str(time_now).replace(' ','_')
+        os.makedirs(os.path.join(save_root,time_now,'progress'))
+        alpha = None
         for idx in pbar:
-            time = torch.tensor([idx] * zt.shape[0], device=device)
-            # zt = zt.requires_grad_()
-            out = self.p_sample(x=zt, t=time, model=model) # alpha
-            vq_theta = torch.exp(self.log_sample_categorical(out['log_z'])) # log_z is a correlations across dimensions generated by VQ-diffusion
-            if idx == self.num_timesteps-1:
-                p_alpha = deepcopy(vq_theta).requires_grad_()
+            batch = {}
+            batch['image'] = img
+            batch['text'] = text
+            ###
+            
+            vq_content = model.generate_content(
+                batch=batch,
+                filter_ratio=0,
+                replicate=1,
+                content_ratio=1,
+                return_att_weight=False,
+                sample_type="top0.86r",
+                start_step = idx+1,
+                predx0=content,
+            )
+            vq_theta = vq_content['x_start'] # discrete, thus no gradient included, predicted x0
+            log_x0_pred = index_to_log_onehot(x0_pred)
+            time = torch.tensor([idx] * img.shape[0], device=device)
+            if alpha == None:
+                alpha = x0_pred
             else:
-                p_alpha = torch.exp(gamma*torch.log(alpha)+(1-gamma)*out)
-            
+                alpha = gamma*alpha + (1-gamma)*log_x0_pred     
+
             max_iter = 1000
-
             
-            # calculate likelihood
-            sample = self.q_sample(measurement, t=time)
-            likelihood_ = torch.sqrt((measurement**2 + sample**2 - 2*torch.matmul(measurement,sample.transpose(1,2))).sum()) # Euclidean distance
-            likelihood = torch.sqrt(((measurement-sample)**2).sum())
 
-            # optimize alpha using adam(according to implementation)
+            # optimize alpha using adam(according to implementation) 优化的是logit
             optimizer = optim.Adam([p_alpha], lr=0.00001)
             for i in range(max_iter):
                 optimizer.zero_grad()
                 # calculate KL divergence
-                #divergence = 0
-                # for i in range(self.num_classes):
-                #     divergence +=p_alpha[:,i]*torch.log(p_alpha[i]/(vq_theta[i]+1e-10))
+                p_alpha = torch.softmax(p_alpha)
                 divergence = (p_alpha*torch.log(p_alpha/(vq_theta+1e-10))).sum()
-                obj = (DL_balance * divergence - (1-DL_balance) * sample)
+                # calculate distance
+                sample = F.gumbel_softmax(p_alpha)
+                sample_img = model.content_codec.decode(sample)
+                likelihood = torch.sqrt(((measurement-sample_img)**2).sum())
+                obj = (DL_balance * divergence - (1-DL_balance) * likelihood)
                 obj.backward()
                 optimizer.step()
                 # Give condition.
@@ -476,14 +434,18 @@ class G2D2(SpacedDiffusion):
             zt = log_onehot_to_index(zt)
             img = model.content_codec.encode(zt)
             img = img.detach_()
-           
+            content_ = model.content_codec.decode(content)
             pbar.set_postfix({'loss': obj}, refresh=False)
             if record:
-                if idx % 10 == 0:
-                    file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
-                    plt.imsave(file_path, img)
-
-        return img 
+                if idx % 1 == 0:
+                    content_ = content_.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
+                    for b in range(content_.shape[0]):
+                        cnt = b
+                        save_base_name = '{}'.format(str(cnt).zfill(6))
+                        save_path = os.path.join(save_root,str(time_now), f"progress/x_{str(idx).zfill(4)}.png")
+                        im = Image.fromarray(content_[b])
+                        im.save(save_path)
+        return img
 
 
 @register_sampler(name='ddim')
@@ -527,17 +489,21 @@ class SS(SpacedDiffusion):
                       measurement_cond_fn,
                       record,
                       save_root,
-                      text = 'a high-quality headshot of a person',
-                      num_class=2887):
+                      text = 'a high-quality headshot of a boy',
+                      num_class=2887,):
         """
         The function used for sampling from noise.
         """ 
         img = x_start
         device = x_start.device 
-        measurement = measurement * 255
+        measurement = torch.clamp(measurement * 255, max=255)
         measurement_ = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
+        content = None
+        pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## self.num_timesteps
 
-        pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## 
+        time_now = datetime.datetime.now()
+        time_now = str(time_now).replace(' ','_')
+        os.makedirs(os.path.join(save_root,time_now,'progress'))
         for idx in pbar:
             batch = {}
             batch['image'] = img
@@ -551,95 +517,30 @@ class SS(SpacedDiffusion):
                 content_ratio=1,
                 return_att_weight=False,
                 sample_type="top0.86r",
+                start_step = idx+1,
+                predx0=content,
             )
-            x_start = vq_content['content']
-            content = vq_content['x_start'] # discrete, thus no gradient included
-            # condition = model.prepare_condition(batch)
-            # cf_condition = model.prepare_condition(batch=batch)
-            # cf_cond_emb = model.transformer.condition_emb(cf_condition['condition_token']).float()
-            # def cf_predict_start(log_x_t, cond_emb, t):
-            #     log_x_recon = model.transformer.predict_start(log_x_t, cond_emb, t)[:, :-1]
-            #     if abs(model.guidance_scale - 1) < 1e-3:
-            #         return torch.cat((log_x_recon, model.transformer.zero_vector), dim=1)
-            #     cf_log_x_recon = model.transformer.predict_start(log_x_t, cf_cond_emb.type_as(cond_emb), t)[:, :-1]
-            #     log_new_x_recon = cf_log_x_recon + model.guidance_scale * (log_x_recon - cf_log_x_recon)
-            #     log_new_x_recon -= torch.logsumexp(log_new_x_recon, dim=1, keepdim=True)
-            #     log_new_x_recon = log_new_x_recon.clamp(-70, 0)
-            #     log_pred = torch.cat((log_new_x_recon, model.transformer.zero_vector), dim=1)
-            #     return log_pred
-            
-            # model.transformer.cf_predict_start = model.predict_start_with_truncation(cf_predict_start, 'top0.86r') # truncation, 截断
-            # model.truncation_forward = True
-            # ###
-            # content = model.prepare_content(batch)
-            # content_samples = {'input_image': img}
-            # content_samples['reconstruction_image'] = model.content_codec.decode(content['content_token']) 
-            # num_content_tokens = int((content['content_token'].shape[1]))
-            # content_token = content['content_token'][:, :num_content_tokens]
+            content = vq_content['x_start'] # discrete, thus no gradient included, predicted x0
             time = torch.tensor([idx] * img.shape[0], device=device)
             
-            # img = img.requires_grad_()
-            # out = self.p_sample(content_token=content_token,content=content,condition=condition, t=time, model=model)
-            # img = model.content_codec.decode(out['content_token'])
-            # Give condition.
-            noisy_measurement = model.transformer.q_sample(measurement_, t=time)
-            noisy_measurement = model.content_codec.decode(noisy_measurement.argmax(1))
-
-            # TODO: how can we handle argument for different condition method?
-            # img, distance = measurement_cond_fn(x_t=content.requires_grad_(),
-            #                           measurement=measurement,
-            #                           noisy_measurement=noisy_measurement,
-            #                           x_prev=img.requires_grad_(),
-            #                           x_0_hat=x_start)
-            img = img.detach_()
+            content_ = model.content_codec.decode(content)
            
             pbar.set_postfix({'distance': 0}, refresh=False) # distance.item()
             
             if record:
-                if idx % 10 == 0:
-                    content = img.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
-                    for b in range(content.shape[0]):
+                if idx % 1 == 0:
+                    content_ = content_.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
+                    for b in range(content_.shape[0]):
                         cnt = b
                         save_base_name = '{}'.format(str(cnt).zfill(6))
-                        save_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
-                        im = Image.fromarray(content[b])
+                        save_path = os.path.join(save_root,str(time_now), f"progress/x_{str(idx).zfill(4)}.png")
+                        im = Image.fromarray(content_[b])
                         im.save(save_path)
                     
                     # file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
                     # plt.imsave(file_path, img)
 
-        return img
-    
-    def p_sample(self, 
-                model, 
-                content_token, 
-                condition,
-                content,
-                t,
-                temperature = 1.,
-                return_rec = True,
-                return_logits = False,
-                return_att_weight = False):
-        filter_ratio = [0, 0.5, 1.0]
-        batch = {}
-        
-        trans_out = model.transformer.sample(condition_token=condition['condition_token'],
-                                                        condition_mask=condition.get('condition_mask', None),
-                                                        condition_embed=condition.get('condition_embed_token', None),
-                                                        content_token=content_token,
-                                                        filter_ratio=filter_ratio[0],
-                                                        temperature=temperature,
-                                                        return_att_weight=return_att_weight,
-                                                        return_logits=return_logits,
-                                                        content_logits=content.get('content_logits', None),
-                                                        sample_type='normal',)
-        log_z0 = trans_out['log_z']
-        log_zt_1 = model.transformer.q_pred(log_x_start=log_z0, t=t)
-        trans_out['sample'] = model.transformer.log_sample_categorical(log_zt_1)
-        trans_out['logzt'] = log_zt_1
-        trans_out['pred_xstart'] = log_z0
-        
-        return trans_out
+        return content
     
 
 # =================

@@ -241,7 +241,8 @@ class GaussianNoise(Noise):
     
     def forward(self, data):
         noised = data + torch.randn_like(data, device=data.device) * self.sigma
-        return torch.clamp(noised, min=0, max=1)
+        a = torch.clamp(noised, min=0, max=1)
+        return noised
 
 
 @register_noise(name='poisson')

@@ -553,6 +553,7 @@ class DiffusionTransformer(nn.Module):
             return_logits = True,
             content_logits = None,
             print_log = True,
+            start_step = 0,
             **kwargs):
         input = {'condition_token': condition_token,
                 'content_token': content_token, 
@@ -567,7 +568,7 @@ class DiffusionTransformer(nn.Module):
             batch_size = kwargs['batch_size']
     
         device = self.log_at.device
-        start_step = int(self.num_timesteps * filter_ratio)
+        # start_step = int(self.num_timesteps * filter_ratio)
 
         # get cont_emb and cond_emb
         if content_token != None:
@@ -597,6 +598,12 @@ class DiffusionTransformer(nn.Module):
                     while min(sampled) < self.n_sample[diffusion_index]:
                         log_z, sampled = self.p_sample(log_z, cond_emb, t, sampled, self.n_sample[diffusion_index])     # log_z is log_onehot
 
+            content_token = log_onehot_to_index(log_z)
+            log_xt = self.q_sample(log_x_start=log_z, t=t)
+            output = {'content_token': log_onehot_to_index(log_xt),
+                    'x_start': content_token}
+            if return_logits:
+                output['logits'] = torch.exp(log_z)
         else:
             t = torch.full((batch_size,), start_step-1, device=device, dtype=torch.long)
             log_x_start = index_to_log_onehot(sample_image, self.num_classes)
@@ -607,13 +614,12 @@ class DiffusionTransformer(nn.Module):
                     t = torch.full((batch_size,), diffusion_index, device=device, dtype=torch.long)
                     log_z = self.p_sample(log_z, cond_emb, t)     # log_z is log_onehot
         
+            content_token = log_onehot_to_index(log_z)
+            output = {'content_token': None,
+                    'x_start': content_token}
+            if return_logits:
+                output['logits'] = torch.exp(log_z)
 
-        content_token = log_onehot_to_index(log_z)
-        log_xt = self.q_sample(log_x_start=log_z, t=t)
-        output = {'content_token': log_onehot_to_index(log_xt),
-                  'x_start': content_token}
-        if return_logits:
-            output['logits'] = torch.exp(log_z)
         return output
 
 

@@ -151,6 +151,8 @@ class DALLE(nn.Module):
         replicate=1,
         return_att_weight=False,
         sample_type="top0.85r",
+        start_step=0,
+        predx0 =None
     ):
         self.eval()
         if condition is None:
@@ -182,8 +184,10 @@ class DALLE(nn.Module):
             for k in condition.keys():
                 if condition[k] is not None:
                     condition[k] = torch.cat([condition[k] for _ in range(replicate)], dim=0)
-            
-        content_token = self.prepare_content(batch=batch)
+        if predx0 is None:
+            content_token = self.prepare_content(batch=batch)
+        else:
+            content_token = {'content_token': predx0}
 
         if len(sample_type.split(',')) > 1:
             if sample_type.split(',')[1][:1]=='q':
@@ -220,11 +224,12 @@ class DALLE(nn.Module):
                                             return_att_weight=return_att_weight,
                                             return_logits=False,
                                             print_log=False,
-                                            sample_type=sample_type)
+                                            sample_type=sample_type,
+                                            start_step=start_step)
 
 
-        content = self.content_codec.decode(trans_out['content_token'])  #(8,1024)->(8,3,256,256)
-        x_start = self.content_codec.decode(trans_out['x_start'])
+        content = trans_out['content_token']  #(8,1024)->(8,3,256,256)
+        x_start = trans_out['x_start']
         self.train()
         out = {
             'content': content,
