@@ -14,6 +14,7 @@ from util.img_utils import clear_color
 from guided_diffusion.posterior_mean_variance import get_mean_processor, get_var_processor
 from PIL import Image
 import datetime
+from copy import deepcopy
 
 
 
@@ -357,9 +358,6 @@ class DDPM(SpacedDiffusion):
 
 @register_sampler(name='g2d2')
 class G2D2(SpacedDiffusion):
-    def multinomial_kl(self, log_prob1, log_prob2):   # compute KL loss on log_prob
-        kl = (log_prob1.exp() * (log_prob1 - log_prob2)).sum(dim=1)
-        return kl
     def p_sample_loop(self,
                       model,
                       x_start,
@@ -368,9 +366,9 @@ class G2D2(SpacedDiffusion):
                       record,
                       save_root,
                       text = 'a high-quality headshot of a boy',
-                      num_class=2887,
-                      gamma = 0.1,
-                      DL_balance= 0.5,
+                      num_class=4096,  #2887 for coco, 4096 for ithq
+                      gamma = 0.7,
+                      DL_balance= 0.0003, # hyperparam deciding divergence-img loss balance, 0.05 according to paper
                       operator=None):
 
         """
@@ -380,8 +378,7 @@ class G2D2(SpacedDiffusion):
         """ 
         img = x_start
         device = x_start.device 
-        measurement = torch.clamp(measurement * 255, max=255)
-        measurement_ = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
+        measurement = measurement * 255
         pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## self.num_timesteps
 
         time_now = datetime.datetime.now()
@@ -390,6 +387,7 @@ class G2D2(SpacedDiffusion):
         
         p_alpha = None
         x0_pred_logit = None
+        DL_list = torch.tensor(list(range(self.num_timesteps,0,-1)))/self.num_timesteps*DL_balance
         
         for idx in pbar:
             batch = {}
@@ -397,50 +395,60 @@ class G2D2(SpacedDiffusion):
             batch['text'] = text
             ###
             
-            vq_content = model.generate_content(
-                batch=batch,
-                filter_ratio=0,
-                replicate=1,
-                content_ratio=1,
-                return_att_weight=False,
-                sample_type="top0.86r",
-                start_step = idx+1,
-                predx0=x0_pred_logit, #logits
-            )
+            # vq_content = model.generate_content(
+            #     batch=batch,
+            #     filter_ratio=0,
+            #     replicate=1,
+            #     content_ratio=1,
+            #     return_att_weight=False,
+            #     sample_type="top0.86r",
+            #     start_step = idx+1,
+            #     predx0=x0_pred_logit, #logits
+            # )
 
-            vq_theta = torch.exp(vq_content['x_start_log'])
+            # vq_theta = torch.exp(vq_content['x_start_log'])
 
-            if p_alpha == None:
-                p_alpha = vq_theta
-            else:
-                p_alpha = gamma*p_alpha + (1-gamma)*vq_theta  
+            # if p_alpha == None:
+            #     p_alpha = deepcopy(vq_theta.requires_grad_())
+            # else:
+            #     new_p_alpha = gamma*p_alpha + (1-gamma)*vq_theta.requires_grad_()
+            #     p_alpha.data.copy_(new_p_alpha)
 
-            max_iter = 1000
-            
+
+            max_iter = 10  
+            p_alpha = torch.rand([1, 4097, 1024]).to('cuda')
+            vq_theta = deepcopy(p_alpha).to('cuda')
 
             # optimize alpha using adam(according to implementation) 优化的是logit
-            optimizer = optim.Adam([p_alpha], lr=0.00001)
+            optimizer = optim.Adam([p_alpha], lr=0.3)
             for i in range(max_iter):
-                optimizer.zero_grad()
+                p_alpha_ = F.softmax(p_alpha,dim=1)
                 # calculate KL divergence
-                p_alpha = torch.softmax(p_alpha,dim=1)
-                divergence = (p_alpha*torch.log(p_alpha/(vq_theta+1e-10))).sum()
+                divergence = (p_alpha_*torch.log(p_alpha_/(vq_theta))).sum()
                 # calculate distance
-                sample = F.gumbel_softmax(p_alpha)
-                Zgum = torch.zeros_like(sample)
-                for i in range(sample.shape[0]):
-                    for j in range(sample.shape[1]):
-                        Zgum[0,i,:] = i * sample[i,j,:]
-                Zgum = Zgum.sum(dim=1)
-                sample_img = model.content_codec.decode(sample)
+                sample = F.gumbel_softmax(p_alpha_,dim=1,tau=1.)
+                k = torch.arange(sample.shape[1]).unsqueeze(1).unsqueeze(0).to(sample.device)
+                Zgum = (k * sample).sum(dim=1).type(dtype=torch.cuda.LongTensor)
+                sample_img = model.content_codec.decode(Zgum)
                 noised_img = operator.forward(sample_img)
                 likelihood = torch.sqrt(((measurement-noised_img)**2).sum())
-                obj = (DL_balance * divergence - (1-DL_balance) * likelihood)
-                obj.backward()
+                obj = (DL_list[idx] * divergence + (1-DL_list[idx]) * likelihood)
+                if i<max_iter-1:
+                    obj.backward(retain_graph=True)
+                else:
+                    obj.backward()
+                # obj.backward()
                 optimizer.step()
+                optimizer.zero_grad()
+                
+                if i%10==0:
+                    print(obj)
+                    pbar.set_postfix({'loss': obj}, refresh=False)
                 # Give condition.
+            
             x0_pred_logit = log_onehot_to_index(p_alpha)
             pbar.set_postfix({'loss': obj}, refresh=False)
+            content_ = model.content_codec.decode(x0_pred_logit)
             if record:
                 if idx % 1 == 0:
                     content_ = content_.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
@@ -636,24 +644,3 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
-
-    # def p_sample(self, x, t, cond, noise):
-
-    #     predicted_x0_logits = self.model_predict(x, t, cond) # bs maxlength cat
-    #     pred_q_posterior_logits = self.q_posterior_logits(predicted_x0_logits, x, t)
-
-    #     noise = torch.clip(noise, self.eps, 1.0)
-
-    #     not_first_step = (t != 1).float().reshape((x.shape[0], *[1] * (x.dim())))
-
-    #     gumbel_noise = -torch.log(-torch.log(noise))
-    #     sample = torch.argmax(
-    #         pred_q_posterior_logits + gumbel_noise * not_first_step, dim=-1
-    #     )
-    #     return sample
-    
-    # def p_sample_starshape(self, x, t, cond, noise):
-    #     pbar = tqdm(list(range(self.num_timesteps))[::-1]) #1kstep for total
-    #     z_t = x
-    #     for idx in pbar:
-    #         z_t_1 = self.p_sample()

@@ -45,7 +45,7 @@ def main():
     # Load model
     
     if "/vq/" in args.model_config:
-        info = get_VQmodel(ema=True, model_path='./OUTPUT/pretrained_model/coco_learnable.pth', config_path=args.model_config, imagenet_cf=False)
+        info = get_VQmodel(ema=True, model_path='./OUTPUT/pretrained_model/ithq_learnable.pth', config_path=args.model_config, imagenet_cf=False)
         model = info['model']
         epoch = info['epoch']
         model_name = info['model_name']
@@ -117,6 +117,7 @@ def main():
         # Sampling
         if "/vq/" in args.model_config:
             x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32)
+            y_n = y_n.detach_()
         else:
             x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
         sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path,operator = operator)
