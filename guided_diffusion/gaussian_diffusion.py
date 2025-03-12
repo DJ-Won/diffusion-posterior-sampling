@@ -158,7 +158,7 @@ class GaussianDiffusion:
                       measurement_cond_fn,
                       record,
                       save_root,
-                      operator):
+                      ):
         """
         The function used for sampling from noise.
         """ 
@@ -365,100 +365,111 @@ class G2D2(SpacedDiffusion):
                       measurement_cond_fn,
                       record,
                       save_root,
-                      text = 'a high-quality headshot of a boy',
+                      text = 'a high-quality headshot of a girl',
                       num_class=4096,  #2887 for coco, 4096 for ithq
-                      gamma = 0.7,
-                      DL_balance= 0.0003, # hyperparam deciding divergence-img loss balance, 0.05 according to paper
-                      operator=None):
+                      forget = 0.3,
+                      operator=None,
+                      content_seq_len=1024,
+                      lambda_lr = 0.05,
+                      base_lr = 0.5,
+                      lambda_kl = 2.,
+                      base_kl = 0.03,
+                      sigma = 0.05,
+                      dist_from_label = True,
+                      label = None):
 
         """
         The function used for sampling from noise.
-        gamma: forget coefficient
+        forget: forget coefficient
         DL_balance: the balance between KL divergence and likelihood.
         """ 
         img = x_start
         device = x_start.device 
-        measurement = measurement * 255
+        measurement = measurement
         pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## self.num_timesteps
-
-        time_now = datetime.datetime.now()
-        time_now = str(time_now).replace(' ','_')
-        os.makedirs(os.path.join(save_root,time_now,'progress'))
+        save_path_ = os.path.join(save_root,'auto','base_kl'+str(base_kl),'forget'+str(forget),'sigma'+str(sigma),'base_lr'+str(base_lr))
+        os.makedirs(save_path_,exist_ok=True)
         
         p_alpha = None
         x0_pred_logit = None
-        DL_list = torch.tensor(list(range(self.num_timesteps,0,-1)))/self.num_timesteps*DL_balance
-        
+        batch_size = 1
+        zero_logits = torch.zeros((batch_size, num_class-1, content_seq_len),device=device) # num classes is from transformer, numclasses include
+        one_logits = torch.ones((batch_size, 1, content_seq_len),device=device)
+        mask_logits = torch.cat((zero_logits, one_logits), dim=1)
+        xt_1_pred_logits = torch.log(mask_logits) # -inf occurs,    
+        batch = {}
+        batch['text'] = text
+        condition = model.prepare_condition(batch=batch)
+        cond_emb = model.transformer.condition_emb(condition['condition_token'])
         for idx in pbar:
-            batch = {}
-            batch['image'] = img
-            batch['text'] = text
             ###
             
-            # vq_content = model.generate_content(
-            #     batch=batch,
-            #     filter_ratio=0,
-            #     replicate=1,
-            #     content_ratio=1,
-            #     return_att_weight=False,
-            #     sample_type="top0.86r",
-            #     start_step = idx+1,
-            #     predx0=x0_pred_logit, #logits
-            # )
+            #mask
 
-            # vq_theta = torch.exp(vq_content['x_start_log'])
+            t = torch.full((batch_size,), idx, device=device, dtype=torch.long)
+            x0_pred_logit = model.transformer.predict_start(xt_1_pred_logits,cond_emb.type_as(xt_1_pred_logits),t).float()
+            vq_theta = x0_pred_logit
 
-            # if p_alpha == None:
-            #     p_alpha = deepcopy(vq_theta.requires_grad_())
-            # else:
-            #     new_p_alpha = gamma*p_alpha + (1-gamma)*vq_theta.requires_grad_()
-            #     p_alpha.data.copy_(new_p_alpha)
+            if p_alpha == None:
+                p_alpha = (vq_theta).clone().detach().requires_grad_(True) 
+            else:
+                with torch.no_grad():
+                    new_p_alpha = forget*p_alpha + (1-forget)*vq_theta
+                    p_alpha.data.copy_(new_p_alpha)
 
-
-            max_iter = 10  
-            p_alpha = torch.rand([1, 4097, 1024]).to('cuda')
-            vq_theta = deepcopy(p_alpha).to('cuda')
+            max_iter = 50
 
             # optimize alpha using adam(according to implementation) 优化的是logit
-            optimizer = optim.Adam([p_alpha], lr=0.3)
+            LRate = base_lr*10**(lambda_lr/2*(2*idx/self.num_timesteps-1))
+            DL_balance  = base_kl*10**(lambda_kl/2*(2*(idx)/self.num_timesteps-1))
+            optimizer = optim.Adam([p_alpha], lr=LRate)
             for i in range(max_iter):
+                sample = F.gumbel_softmax(p_alpha,dim=1,tau=1.)
+                optimizer.zero_grad(set_to_none=True)
                 p_alpha_ = F.softmax(p_alpha,dim=1)
                 # calculate KL divergence
-                divergence = (p_alpha_*torch.log(p_alpha_/(vq_theta))).sum()
+                # divergence = (sample*(sample.log()-vq_theta)).sum()
+                divergence = (p_alpha_*((p_alpha_/torch.softmax(vq_theta,dim=1)).log())).sum()
                 # calculate distance
-                sample = F.gumbel_softmax(p_alpha_,dim=1,tau=1.)
-                k = torch.arange(sample.shape[1]).unsqueeze(1).unsqueeze(0).to(sample.device)
-                Zgum = (k * sample).sum(dim=1).type(dtype=torch.cuda.LongTensor)
-                sample_img = model.content_codec.decode(Zgum)
-                noised_img = operator.forward(sample_img)
-                likelihood = torch.sqrt(((measurement-noised_img)**2).sum())
-                obj = (DL_list[idx] * divergence + (1-DL_list[idx]) * likelihood)
-                if i<max_iter-1:
-                    obj.backward(retain_graph=True)
-                else:
-                    obj.backward()
-                # obj.backward()
+                sample_img = model.content_codec.decode(sample,gumbel=True)/255*2-1
+                degraded_img = operator.forward(sample_img)
+                nll = ((measurement-degraded_img)**2).sum()/(2*sigma**2) # 
+                # nll = ((measurement-degraded_img)**2).sqrt().sum()/(2*0.05**2)
+                obj =   (1-DL_balance) * nll + DL_balance * divergence
+                # obj = divergence
+                obj.backward()
                 optimizer.step()
-                optimizer.zero_grad()
                 
+
                 if i%10==0:
-                    print(obj)
+                    # print('\n')
+                    # print('nll',nll)
+                    # print('divergence',divergence)
+                    # print('obj',obj)
                     pbar.set_postfix({'loss': obj}, refresh=False)
                 # Give condition.
             
             x0_pred_logit = log_onehot_to_index(p_alpha)
             pbar.set_postfix({'loss': obj}, refresh=False)
             content_ = model.content_codec.decode(x0_pred_logit)
+            # q(xt-1|x0)
+            xt_1_pred_logits = model.transformer.q_sample(p_alpha,t-1)
             if record:
                 if idx % 1 == 0:
-                    content_ = content_.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
-                    for b in range(content_.shape[0]):
+                    content__ = content_.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
+                    for b in range(content__.shape[0]):
                         cnt = b
-                        save_base_name = '{}'.format(str(cnt).zfill(6))
-                        save_path = os.path.join(save_root,str(time_now), f"progress/x_{str(idx).zfill(4)}.png")
-                        im = Image.fromarray(content_[b])
+                        save_path = os.path.join(save_path_, f"x_{str(idx).zfill(4)}.png") 
+                        im = Image.fromarray(content__[b])
                         im.save(save_path)
-        return img
+        label_recon_dist = None
+        if dist_from_label:
+            try:
+                label_recon_dist = ((label-content_[0])**2).sum()
+            except:
+                raise NotImplementedError("label")
+                
+        return img,label_recon_dist
 
 
 @register_sampler(name='ddim')
@@ -502,59 +513,62 @@ class SS(SpacedDiffusion):
                       measurement_cond_fn,
                       record,
                       save_root,
-                      text = 'a high-quality headshot of a boy',
-                      num_class=2887,
-                      operator=None):
+                      text = 'a high-quality headshot of a girl',
+                      num_class=4096,  #2887 for coco, 4096 for ithq
+                      forget = 0.3,
+                      operator=None,
+                      content_seq_len=1024,
+                      lambda_lr = 0.05,
+                      base_lr = 0.5,
+                      lambda_kl = 2.,
+                      base_kl = 0.03):
+
         """
         The function used for sampling from noise.
+        forget: forget coefficient
+        DL_balance: the balance between KL divergence and likelihood.
         """ 
         img = x_start
         device = x_start.device 
-        measurement = torch.clamp(measurement * 255, max=255)
-        measurement_ = index_to_log_onehot(model.content_codec.get_tokens(measurement)['token'],num_class)
-        content = None
+        measurement = measurement
         pbar = tqdm(list(range(self.num_timesteps))[::-1]) ## self.num_timesteps
 
         time_now = datetime.datetime.now()
         time_now = str(time_now).replace(' ','_')
-        os.makedirs(os.path.join(save_root,time_now,'progress'))
+        os.makedirs(os.path.join(save_root,'ss'),exist_ok=True)
+        
+        p_alpha = None
+        x0_pred_logit = None
+        batch_size = 1
+        zero_logits = torch.zeros((batch_size, num_class-1, content_seq_len),device=device) # num classes is from transformer, numclasses include
+        one_logits = torch.ones((batch_size, 1, content_seq_len),device=device)
+        mask_logits = torch.cat((zero_logits, one_logits), dim=1)
+        xt_1_pred_logits = torch.log(mask_logits) # -inf occurs,    
+        batch = {}
+        batch['text'] = text
+        condition = model.prepare_condition(batch=batch)
+        cond_emb = model.transformer.condition_emb(condition['condition_token'])
         for idx in pbar:
-            batch = {}
-            batch['image'] = img
-            batch['text'] = text
             ###
             
-            vq_content = model.generate_content(
-                batch=batch,
-                filter_ratio=0,
-                replicate=1,
-                content_ratio=1,
-                return_att_weight=False,
-                sample_type="top0.86r",
-                start_step = idx+1,
-                predx0=content,
-            )
-            content = vq_content['x_start'] # discrete, thus no gradient included, predicted x0
-            time = torch.tensor([idx] * img.shape[0], device=device)
+            #mask
+
+            t = torch.full((batch_size,), idx, device=device, dtype=torch.long)
+            x0_pred_logit = model.transformer.predict_start(xt_1_pred_logits,cond_emb.type_as(xt_1_pred_logits),t).float()
             
-            content_ = model.content_codec.decode(content)
-           
-            pbar.set_postfix({'distance': 0}, refresh=False) # distance.item()
-            
+            x0_pred_idx = log_onehot_to_index(x0_pred_logit)
+            content_ = model.content_codec.decode(x0_pred_idx)
+            # q(xt-1|x0)
+            xt_1_pred_logits = model.transformer.q_sample(x0_pred_logit,t-1)
             if record:
                 if idx % 1 == 0:
                     content_ = content_.permute(0, 2, 3, 1).to('cpu').numpy().astype(np.uint8)
                     for b in range(content_.shape[0]):
                         cnt = b
-                        save_base_name = '{}'.format(str(cnt).zfill(6))
-                        save_path = os.path.join(save_root,str(time_now), f"progress/x_{str(idx).zfill(4)}.png")
+                        save_path = os.path.join(save_root,'base_kl_noinverse'+str(base_kl),'forget'+str(forget), f"x_{str(idx).zfill(4)}.png") 
                         im = Image.fromarray(content_[b])
                         im.save(save_path)
-                    
-                    # file_path = os.path.join(save_root, f"progress/x_{str(idx).zfill(4)}.png")
-                    # plt.imsave(file_path, img)
-
-        return content
+        return img
     
 
 # =================

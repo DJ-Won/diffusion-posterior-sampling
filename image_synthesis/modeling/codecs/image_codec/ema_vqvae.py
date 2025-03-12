@@ -39,7 +39,7 @@ class Decoder(nn.Module):
         self.w = w
         self.h = h
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def forward(self, indices):
         z = self.quantize.get_codebook_entry(indices.view(-1), shape=(indices.shape[0], self.h, self.w))
         quant = self.post_quant_conv(z)
@@ -47,6 +47,18 @@ class Decoder(nn.Module):
         x = torch.clamp(dec, -1., 1.)
         x = (x + 1.)/2.
         return x
+    def gumbel_foward(self, vec):
+        codebook = self.quantize.embed_weight
+        b,f,w  = vec.shape #4096 128
+        vec = vec[:,:-1,:]
+        z =torch.einsum('ijk,jl->ilk',[vec,codebook]).reshape(b,codebook.shape[1],self.h,self.w)
+        # z = torch.mul(codebook,vec).reshape(codebook.shape[0],self.h,self.w,b).permute(3,0,1,2) # -> bs,128,32,32
+        quant = self.post_quant_conv(z)
+        dec = self.decoder(quant)
+        x = torch.clamp(dec, -1., 1.)
+        x = (x + 1.)/2.
+        return x
+        return  #4096,128
 
 class PatchVQVAE(BaseCodec):
     def __init__(
@@ -117,15 +129,19 @@ class PatchVQVAE(BaseCodec):
         # output = {'token': rearrange(code, 'b h w -> b (h w)')}
         return output
 
-    def decode(self, img_seq):
-        b, n = img_seq.shape
-        # if self.token_shape is not None:
-        #     img_seq = img_seq.view(b, self.token_shape[0], self.token_shape[1])
-        # else:
-        #     img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(sqrt(n)))
-        img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
+    def decode(self, img_seq,gumbel=False):
+        if not gumbel:
+            b, n = img_seq.shape
+            # if self.token_shape is not None:
+            #     img_seq = img_seq.view(b, self.token_shape[0], self.token_shape[1])
+            # else:
+            #     img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(sqrt(n)))
+            img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
 
-        x_rec = self.dec(img_seq)
+            x_rec = self.dec(img_seq)
+            x_rec = self.postprocess(x_rec)
+            return x_rec
+        x_rec = self.dec.gumbel_foward(img_seq)
         x_rec = self.postprocess(x_rec)
         return x_rec
 

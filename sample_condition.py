@@ -39,6 +39,7 @@ def main():
     device = torch.device(device_str)  
     
     # Load configurations
+    print(args.diffusion_config)
     diffusion_config = load_yaml(args.diffusion_config)
     task_config = load_yaml(args.task_config)
     
@@ -94,42 +95,43 @@ def main():
         
     # Do Inference
     for i, ref_img in enumerate(loader):
-        logger.info(f"Inference for image {i}")
-        fname = str(i).zfill(5) + '.png'
-        ref_img = ref_img.to(device)
+        for klbase in [0.1,0.08,0.06]:
+            for forget in [4]:
+                logger.info(f"Inference for image {i}")
+                fname = str(i).zfill(5) + '.png'
+                ref_img = ref_img.to(device)
 
-        # Exception) In case of inpainging,
-        if measure_config['operator'] ['name'] == 'inpainting':
-            mask = mask_gen(ref_img)
-            mask = mask[:, 0, :, :].unsqueeze(dim=0)
-            measurement_cond_fn = partial(cond_method.conditioning, mask=mask)
-            sample_fn = partial(sample_fn, measurement_cond_fn=measurement_cond_fn)
+                # Exception) In case of inpainging,
+                if measure_config['operator'] ['name'] == 'inpainting':
+                    mask = mask_gen(ref_img)
+                    mask = mask[:, 0, :, :].unsqueeze(dim=0)
+                    measurement_cond_fn = partial(cond_method.conditioning, mask=mask)
+                    sample_fn = partial(sample_fn, measurement_cond_fn=measurement_cond_fn)
 
-            # Forward measurement model (Ax + n)
-            y = operator.forward(ref_img, mask=mask)
-            y_n = noiser(y)
-
-        else: 
-            # Forward measurement model (Ax + n) 此处给y添加噪声
-            y = operator.forward(ref_img)
-            y_n = noiser(y)
-         
-        # Sampling
-        if "/vq/" in args.model_config:
-            x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32)
-            y_n = y_n.detach_()
-        else:
-            x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
-        sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path,operator = operator)
-
-        plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))
-        plt.imsave(os.path.join(out_path, 'label', fname), clear_color(ref_img))
-        if "/vq/" in args.model_config:
-            pass
-            # plt.imsave(os.path.join(out_path, 'recon', fname), sample)
-        else:
-            plt.imsave(os.path.join(out_path, 'recon', fname), clear_color(sample))
-        break
+                    # Forward measurement model (Ax + n)
+                    y = operator.forward(ref_img, mask=mask)
+                    y_n = noiser(y)
+                else: 
+                    # Forward measurement model (Ax + n) 此处给y添加噪声
+                    y = operator.forward(ref_img)
+                    y_n = noiser(y)
+                
+                # Sampling
+                if "/vq/" in args.model_config:
+                    x_start = torch.randint(0, 256, ref_img.shape,device=device, dtype=torch.float32)
+                    y_n = y_n.detach_()
+                    sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path,operator = operator, 
+                                    base_kl=klbase,gamma=forget/10)
+                else:
+                    x_start = torch.randn(ref_img.shape, device=device).requires_grad_()
+                    sample = sample_fn(x_start=x_start, measurement=y_n, record=True, save_root=out_path)
+                plt.imsave(os.path.join(out_path, 'input', fname), clear_color(y_n))
+                plt.imsave(os.path.join(out_path, 'label', fname), clear_color(ref_img))
+                if "/vq/" in args.model_config:
+                    pass
+                    # plt.imsave(os.path.join(out_path, 'recon', fname), sample)
+                else:
+                    plt.imsave(os.path.join(out_path, 'recon', fname), clear_color(sample))
 
 if __name__ == '__main__':
     main()
